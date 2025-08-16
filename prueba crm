@@ -1,0 +1,117 @@
+{
+  "name": "CRM - Llamadas -> Transcripción -> Resumen -> Airtable",
+  "nodes": [
+    {
+      "id": "webhook_in",
+      "type": "webhook",
+      "label": "Webhook IN",
+      "description": "Recibe audio_url, phone, timestamp, contact_name opcional",
+      "outputs": ["data"],
+      "config": {
+        "method": "POST",
+        "path": "/crm/call"
+      }
+    },
+    {
+      "id": "stt",
+      "type": "httpRequest",
+      "label": "Transcripción (Whisper API)",
+      "inputs": { "data": "webhook_in.data" },
+      "outputs": ["transcript"],
+      "config": {
+        "url": "https://api.openai.com/v1/audio/transcriptions",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer {{OPENAI_API_KEY}}"
+        },
+        "sendBodyAs": "form-data",
+        "formData": [
+          { "name": "model", "value": "whisper-1" },
+          { "name": "response_format", "value": "text" },
+          { "name": "file", "type": "file_url", "value": "{{data.audio_url}}" }
+        ],
+        "resultMap": { "transcript": "{{response.body}}" }
+      }
+    },
+    {
+      "id": "llm",
+      "type": "llm",
+      "label": "Resumen estructurado (JSON)",
+      "inputs": {
+        "system": "Eres un asistente que resume llamadas y devuelve JSON válido exactamente con el esquema indicado.",
+        "prompt": "Tarea: Devuelve un JSON con estas claves:\\n{\\n  \\\"resumen\\\": string (5-8 líneas),\\n  \\\"puntos_clave\\\": array de strings,\\n  \\\"proximas_acciones\\\": array de objetos {accion, due_date (YYYY-MM-DD o null)},\\n  \\\"sentimiento\\\": \\\"positivo\\\"|\\\"neutral\\\"|\\\"negativo\\\",\\n  \\\"campos_extraidos\\\": {presupuesto_eur (número o null), interes_1_5 (1-5 o null), objeciones (array o [])}\\n}\\nReglas: si un dato no se menciona, usa null. No inventes. Responde SOLO JSON válido, sin texto adicional.\\n\\nTranscripción:\\n{{transcript}}",
+        "variables": { "transcript": "{{stt.transcript}}" }
+      },
+      "outputs": ["json"],
+      "config": {
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "temperature": 0.2,
+        "response_format": "json_object"
+      }
+    },
+    {
+      "id": "airtable_upsert_contact",
+      "type": "httpRequest",
+      "label": "Airtable Upsert Contact by phone",
+      "inputs": { "json": "{{llm.json}}", "data": "webhook_in.data" },
+      "outputs": ["contact_id"],
+      "config": {
+        "url": "https://api.airtable.com/v0/{{AIRTABLE_BASE_ID}}/Contacts",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer {{AIRTABLE_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "fields": {
+            "name": "{{data.contact_name || ''}}",
+            "phone": "{{data.phone || ''}}",
+            "email": "{{data.email || ''}}"
+          }
+        },
+        "resultMap": { "contact_id": "{{response.body.id}}" }
+      }
+    },
+    {
+      "id": "airtable_create_call",
+      "type": "httpRequest",
+      "label": "Airtable -> Calls (create)",
+      "inputs": {
+        "json": "{{llm.json}}",
+        "data": "webhook_in.data",
+        "contact_id": "{{airtable_upsert_contact.contact_id}}"
+      },
+      "outputs": ["record_id"],
+      "config": {
+        "url": "https://api.airtable.com/v0/{{AIRTABLE_BASE_ID}}/Calls",
+        "method": "POST",
+        "headers": {
+          "Authorization": "Bearer {{AIRTABLE_API_KEY}}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "fields": {
+            "timestamp": "{{data.timestamp}}",
+            "phone": "{{data.phone}}",
+            "contact": [ { "id": "{{contact_id}}" } ],
+            "audio_url": "{{data.audio_url}}",
+            "transcript": "{{stt.transcript}}",
+            "summary": "{{json.resumen}}",
+            "next_actions": "{{json.proximas_acciones}}",
+            "sentiment": "{{json.sentimiento}}",
+            "tags": "{{data.tags || ''}}",
+            "status": "open"
+          }
+        },
+        "resultMap": { "record_id": "{{response.body.id}}" }
+      }
+    }
+  ],
+  "edges": [
+    { "from": "webhook_in", "to": "stt" },
+    { "from": "stt", "to": "llm" },
+    { "from": "llm", "to": "airtable_upsert_contact" },
+    { "from": "airtable_upsert_contact", "to": "airtable_create_call" }
+  ]
+}
